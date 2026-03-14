@@ -53,6 +53,7 @@ class TmuxClient:
 
         - The user's home directory itself (``~/``)
         - Any subdirectory under the home directory (``~/projects/foo``)
+        - Paths under ``/mnt/`` (e.g. WSL mounted drives: ``/mnt/d/Phani/...``)
         - Paths that resolve to the home tree after symlink resolution
           (e.g., ``/home/user`` -> ``/local/home/user`` on AWS)
 
@@ -61,7 +62,7 @@ class TmuxClient:
         - System directories: ``/``, ``/bin``, ``/sbin``, ``/usr/bin``,
           ``/usr/sbin``, ``/etc``, ``/var``, ``/tmp``, ``/dev``, ``/proc``,
           ``/sys``, ``/root``, ``/boot``, ``/lib``, ``/lib64``
-        - Any path outside the user's home directory tree
+        - Any path outside the user's home directory tree or /mnt/
 
         Args:
             working_directory: Optional directory path, defaults to current directory
@@ -86,41 +87,31 @@ class TmuxClient:
 
         home_dir = os.path.realpath(os.path.expanduser("~"))
 
-        # Step 2: Path containment — startswith is recognized by CodeQL as a
-        # SafeAccessCheck that clears the NormalizedUnchecked taint state.
-        # This MUST be an unconditional startswith guard (no compound `and`)
-        # so CodeQL recognizes it on all code paths to filesystem operations.
-        if not safe_working_directory.startswith(home_dir):
-            raise ValueError(
-                f"Working directory not allowed: {working_directory} "
-                f"(resolves to {safe_working_directory}, which is outside "
-                f"home directory {home_dir})"
-            )
-
-        # Step 3: Precise directory boundary check.
-        # The startswith(home_dir) above is slightly permissive (e.g.,
-        # "/home/user2" matches "/home/user"). This ensures the path is
-        # either exactly home_dir or a proper child of it.
-        if safe_working_directory != home_dir and not safe_working_directory.startswith(
-            home_dir + os.sep
-        ):
-            raise ValueError(
-                f"Working directory not allowed: {working_directory} "
-                f"(resolves to {safe_working_directory}, which is outside "
-                f"home directory {home_dir})"
-            )
-
-        # Step 4: Block sensitive system directories
+        # Step 2: Block sensitive system directories
         if safe_working_directory in self._BLOCKED_DIRECTORIES:
             raise ValueError(
                 f"Working directory not allowed: {working_directory} "
                 f"(resolves to blocked path {safe_working_directory})"
             )
 
-        # Step 5: Resolve symlinks and re-validate containment.
-        # This prevents symlink-based escapes from the home directory.
+        # Step 3: Allow path under home directory, or under /mnt/ (e.g. WSL mounted drives)
+        under_home = (
+            safe_working_directory == home_dir
+            or safe_working_directory.startswith(home_dir + os.sep)
+        )
+        under_mnt = safe_working_directory.startswith(os.sep + "mnt" + os.sep)
+        if not under_home and not under_mnt:
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(resolves to {safe_working_directory}, which is outside "
+                f"home directory {home_dir} or /mnt/)"
+            )
+
+        # Step 4: Resolve symlinks and re-validate
         real_path = os.path.realpath(safe_working_directory)
-        if not real_path.startswith(home_dir + os.sep) and real_path != home_dir:
+        if under_home and real_path != home_dir and not real_path.startswith(
+            home_dir + os.sep
+        ):
             raise ValueError(
                 f"Working directory not allowed: {working_directory} "
                 f"(symlink resolves to {real_path}, which is outside "
@@ -145,6 +136,12 @@ class TmuxClient:
 
             environment = os.environ.copy()
             environment["CAO_TERMINAL_ID"] = terminal_id
+            # Ensure Cursor CLI (agent) and other user CLIs in ~/.local/bin are found in tmux
+            local_bin = os.path.expanduser("~/.local/bin")
+            if os.path.isdir(local_bin):
+                path = environment.get("PATH", "")
+                if local_bin not in path.split(os.pathsep):
+                    environment["PATH"] = local_bin + os.pathsep + path
 
             session = self.server.new_session(
                 session_name=session_name,
@@ -179,10 +176,17 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
+            env = os.environ.copy()
+            env["CAO_TERMINAL_ID"] = terminal_id
+            local_bin = os.path.expanduser("~/.local/bin")
+            if os.path.isdir(local_bin):
+                path = env.get("PATH", "")
+                if local_bin not in path.split(os.pathsep):
+                    env["PATH"] = local_bin + os.pathsep + path
             window = session.new_window(
                 window_name=window_name,
                 start_directory=working_directory,
-                environment={"CAO_TERMINAL_ID": terminal_id},
+                environment=env,
             )
 
             logger.info(

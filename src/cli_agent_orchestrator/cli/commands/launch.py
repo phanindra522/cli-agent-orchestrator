@@ -14,6 +14,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "codex",
     "kiro_cli",
     "gemini_cli",
+    "cursor_cli",
 }
 
 
@@ -59,7 +60,8 @@ def launch(agents, session_name, headless, provider, yolo):
         if session_name:
             params["session_name"] = session_name
 
-        response = requests.post(url, params=params)
+        # Session creation can take 1–2 min for Cursor CLI (init + idle detection)
+        response = requests.post(url, params=params, timeout=130)
         response.raise_for_status()
 
         terminal = response.json()
@@ -72,6 +74,14 @@ def launch(agents, session_name, headless, provider, yolo):
             subprocess.run(["tmux", "attach-session", "-t", terminal["session_name"]])
 
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
+        msg = str(e)
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                body = e.response.json()
+                if isinstance(body, dict) and body.get("detail"):
+                    msg = f"{msg}\nServer detail: {body['detail']}"
+            except Exception:
+                pass
+        raise click.ClickException(f"Failed to connect to cao-server: {msg}")
     except Exception as e:
         raise click.ClickException(str(e))

@@ -27,7 +27,7 @@ from cli_agent_orchestrator.clients.database import (
     list_terminals_by_session,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.constants import LOG_DIR, SESSION_PREFIX
 from cli_agent_orchestrator.providers.manager import provider_manager
 
 logger = logging.getLogger(__name__)
@@ -37,10 +37,41 @@ def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
         tmux_sessions = tmux_client.list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        cao_sessions = [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        logger.info(
+            "list_sessions: %d tmux session(s), %d CAO session(s) (prefix %r)",
+            len(tmux_sessions),
+            len(cao_sessions),
+            SESSION_PREFIX,
+        )
+        return cao_sessions
     except Exception as e:
-        logger.error(f"Failed to list sessions: {e}")
+        logger.error("Failed to list sessions: %s", e, exc_info=True)
         return []
+
+
+def list_sessions_debug() -> Dict:
+    """Return detailed session info for debugging: raw tmux list, CAO list, log path."""
+    try:
+        tmux_sessions = tmux_client.list_sessions()
+        cao_sessions = [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        return {
+            "tmux_sessions_total": len(tmux_sessions),
+            "cao_sessions_count": len(cao_sessions),
+            "session_prefix": SESSION_PREFIX,
+            "tmux_sessions": tmux_sessions,
+            "cao_sessions": cao_sessions,
+            "log_dir": str(LOG_DIR),
+            "hint": "If cao_sessions_count is 0, no session was created or it was cleaned up after init timeout. Check server log in log_dir for Cursor CLI init details.",
+        }
+    except Exception as e:
+        logger.exception("list_sessions_debug failed: %s", e)
+        return {
+            "error": str(e),
+            "tmux_sessions": [],
+            "cao_sessions": [],
+            "log_dir": str(LOG_DIR),
+        }
 
 
 def get_session(session_name: str) -> Dict:

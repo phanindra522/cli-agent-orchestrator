@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
@@ -16,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     INBOX_POLLING_INTERVAL,
+    LOG_DIR,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -30,6 +32,7 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
+from cli_agent_orchestrator.providers.cursor_cli import ProviderError as CursorProviderError
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -119,6 +122,448 @@ app = FastAPI(
 )
 
 
+def _root_response():
+    return {
+        "service": "CLI Agent Orchestrator",
+        "version": SERVER_VERSION,
+        "dashboard": "/dashboard",
+        "docs": "/docs",
+        "health": "/health",
+        "sessions": "/sessions",
+    }
+
+
+@app.get("/", include_in_schema=True)
+async def root():
+    """Root route so browsers get a response instead of 404."""
+    return _root_response()
+
+
+@app.get("/dashboard/data")
+async def dashboard_data() -> Dict:
+    """Return all sessions and their terminals (with live status when available)."""
+    try:
+        sessions_raw = session_service.list_sessions()
+        sessions_out = []
+        for s in sessions_raw:
+            sid = s.get("id") or s.get("name", "")
+            try:
+                detail = session_service.get_session(sid)
+                terminals = detail.get("terminals") or []
+                terminals_with_status = []
+                for t in terminals:
+                    tid = t.get("id")
+                    row = {
+                        "id": tid,
+                        "name": t.get("tmux_window") or t.get("name") or tid,
+                        "provider": t.get("provider", ""),
+                        "agent_profile": t.get("agent_profile") or "",
+                        "last_active": str(t.get("last_active")) if t.get("last_active") else None,
+                        "status": None,
+                    }
+                    if tid:
+                        try:
+                            full = terminal_service.get_terminal(tid)
+                            row["status"] = full.get("status")
+                        except Exception:
+                            pass
+                    terminals_with_status.append(row)
+                sessions_out.append(
+                    {
+                        "id": sid,
+                        "name": sid,
+                        "session_status": s.get("status", "detached"),
+                        "terminals": terminals_with_status,
+                    }
+                )
+            except Exception as e:
+                logger.debug("Skip session %s: %s", sid, e)
+                sessions_out.append(
+                    {"id": sid, "name": sid, "session_status": s.get("status"), "terminals": []}
+                )
+        return {"sessions": sessions_out}
+    except Exception as e:
+        logger.exception("Dashboard data failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAO · Agents Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #0c0d0f;
+      --surface: #141619;
+      --surface-hover: #1a1c20;
+      --border: #25282e;
+      --text: #e8eaed;
+      --text-muted: #8b909a;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #22c55e;
+      --warning: #eab308;
+      --error: #ef4444;
+      --processing: #0ea5e9;
+    }
+    body {
+      font-family: 'Outfit', system-ui, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .layout {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1.5rem;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .logo span { color: var(--accent); }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: 0.875rem;
+    }
+    .nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+    }
+    .nav a:hover { color: var(--accent); }
+    .stats {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem 1.25rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .stat-num { font-size: 1.5rem; font-weight: 600; color: var(--accent); }
+    .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .btn {
+      font-family: inherit;
+      font-size: 0.875rem;
+      font-weight: 500;
+      border: none;
+      border-radius: 8px;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-ghost { background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--surface-hover); color: var(--text); }
+    .btn-danger { background: rgba(239,68,68,0.15); color: var(--error); }
+    .btn-danger:hover { background: rgba(239,68,68,0.25); }
+    .btn-sm { padding: 0.35rem 0.65rem; font-size: 0.8rem; }
+    .refresh-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      margin-right: 0.35rem;
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .sessions {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .session-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .session-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      padding: 1rem 1.25rem;
+      background: var(--surface-hover);
+      border-bottom: 1px solid var(--border);
+    }
+    .session-name {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .session-actions { display: flex; align-items: center; gap: 0.5rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .badge-active { background: rgba(34,197,94,0.2); color: #4ade80; }
+    .badge-detached { background: rgba(139,144,154,0.2); color: var(--text-muted); }
+    .badge-idle { background: rgba(34,197,94,0.2); color: #4ade80; }
+    .badge-processing { background: rgba(14,165,233,0.2); color: #38bdf8; }
+    .badge-completed { background: rgba(139,92,246,0.2); color: #a78bfa; }
+    .badge-error { background: rgba(239,68,68,0.2); color: #f87171; }
+    .badge-waiting { background: rgba(234,179,8,0.2); color: #facc15; }
+    .agents-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+      padding: 1.25rem;
+    }
+    .agent-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      transition: border-color 0.15s;
+    }
+    .agent-card:hover { border-color: var(--accent); }
+    .agent-name {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+      font-size: 0.9rem;
+      margin-bottom: 0.35rem;
+    }
+    .agent-meta {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 0.5rem;
+    }
+    .agent-meta span { margin-right: 0.5rem; }
+    .agent-status-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+    .agent-last { font-size: 0.75rem; color: var(--text-muted); }
+    .empty-state {
+      text-align: center;
+      padding: 3rem 1.5rem;
+      background: var(--surface);
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+      color: var(--text-muted);
+    }
+    .empty-state code {
+      display: block;
+      margin-top: 1rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg);
+      border-radius: 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--text);
+      text-align: left;
+      overflow-x: auto;
+    }
+    .error-state { color: var(--error); }
+    .attach-hint {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .attach-hint code { font-family: 'JetBrains Mono', monospace; }
+    .troubleshoot-box {
+      margin-top: 1.5rem;
+      padding: 1rem 1.25rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      text-align: left;
+      font-size: 0.875rem;
+    }
+    .troubleshoot-box p { margin: 0.5rem 0; }
+    .troubleshoot-box p:first-of-type { margin-top: 0; }
+    .troubleshoot-box a { color: var(--accent); }
+    .troubleshoot-box a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header>
+      <h1 class="logo">CAO <span>·</span> Agents</h1>
+      <nav class="nav">
+        <a href="/">API</a>
+        <a href="/docs">Docs</a>
+        <a href="/health">Health</a>
+      </nav>
+    </header>
+    <div class="controls">
+      <span class="refresh-dot" title="Auto-refresh every 5s"></span>
+      <span style="font-size:0.8rem;color:var(--text-muted);">Auto-refresh 5s</span>
+      <button class="btn btn-primary" onclick="load()">Refresh now</button>
+    </div>
+    <div id="stats" class="stats" style="display:none;"></div>
+    <div id="content">
+      <p class="empty-state">Loading…</p>
+    </div>
+  </div>
+  <script>
+    const REFRESH_MS = 5000;
+    let refreshTimer = null;
+
+    function statusClass(s) {
+      if (!s) return '';
+      const map = { idle: 'idle', processing: 'processing', completed: 'completed', error: 'error', waiting_user_answer: 'waiting' };
+      return 'badge-' + (map[s] || 'idle');
+    }
+    function sessionClass(s) {
+      return s === 'active' ? 'badge-active' : 'badge-detached';
+    }
+    function escapeHtml(str) {
+      if (!str) return '';
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+    function formatLastActive(ts) {
+      if (!ts) return '—';
+      try {
+        const d = new Date(ts);
+        const now = new Date();
+        const diff = (now - d) / 1000;
+        if (diff < 60) return 'just now';
+        if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+        if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+        return d.toLocaleDateString();
+      } catch (_) { return ts; }
+    }
+    async function shutdownSession(sessionName) {
+      if (!confirm('Shutdown session "' + sessionName + '" and all its agents?')) return;
+      try {
+        const r = await fetch('/sessions/' + encodeURIComponent(sessionName), { method: 'DELETE' });
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        load();
+      } catch (e) {
+        alert('Failed: ' + e.message);
+      }
+    }
+    async function load() {
+      const contentEl = document.getElementById('content');
+      const statsEl = document.getElementById('stats');
+      contentEl.innerHTML = '<p class="empty-state">Loading…</p>';
+      statsEl.style.display = 'none';
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(function() { controller.abort(); }, 15000);
+        const r = await fetch('/dashboard/data', { signal: controller.signal, cache: 'no-store' });
+        clearTimeout(timeoutId);
+        if (!r.ok) throw new Error(r.statusText);
+        const data = await r.json();
+        const sessions = data.sessions || [];
+        const totalAgents = sessions.reduce((n, s) => n + (s.terminals || []).length, 0);
+
+        if (sessions.length === 0) {
+          let emptyHtml = '<div class="empty-state"><p>No agents running.</p><p>Start a session from your terminal (in the same environment as this server):</p><code>cao launch --agents code_supervisor --provider cursor_cli --yolo</code>';
+          try {
+            const dr = await fetch('/debug/sessions', { cache: 'no-store' });
+            if (dr.ok) {
+              const debug = await dr.json();
+              const tmuxTotal = debug.tmux_sessions_total ?? '—';
+              const caoCount = debug.cao_sessions_count ?? '—';
+              const prefix = debug.session_prefix || 'cao-';
+              emptyHtml += '<div class="troubleshoot-box"><p><strong>Troubleshooting</strong></p><p>This server sees <strong>' + tmuxTotal + '</strong> tmux session(s) and <strong>' + caoCount + '</strong> CAO session(s) (prefix <code>' + escapeHtml(prefix) + '</code>).</p>';
+              if (tmuxTotal === 0) {
+                emptyHtml += '<p>If you launched agents in <strong>WSL</strong>, start the CAO server inside WSL too so it sees the same tmux and database:<br><code>bash scripts/start-server-wsl.sh</code> or <code>cao-server</code></p>';
+              }
+              emptyHtml += '<p><a href="/debug/sessions" target="_blank" rel="noopener">View full debug (JSON)</a></p></div>';
+            }
+          } catch (_) {}
+          emptyHtml += '</div>';
+          contentEl.innerHTML = emptyHtml;
+          if (refreshTimer) clearTimeout(refreshTimer);
+          refreshTimer = setTimeout(load, REFRESH_MS);
+          return;
+        }
+
+        statsEl.innerHTML = '<div class="stat"><div class="stat-num">' + sessions.length + '</div><div class="stat-label">Sessions</div></div><div class="stat"><div class="stat-num">' + totalAgents + '</div><div class="stat-label">Agents</div></div>';
+        statsEl.style.display = 'flex';
+
+        let html = '<div class="sessions">';
+        for (const s of sessions) {
+          const terms = s.terminals || [];
+          const sessionName = escapeHtml(s.name || s.id);
+          html += '<div class="session-card"><div class="session-header">';
+          html += '<span class="session-name">' + sessionName + '</span>';
+          html += '<span class="badge ' + sessionClass(s.session_status) + '">' + (s.session_status || 'detached') + '</span>';
+          html += '<div class="session-actions">';
+          html += '<span class="attach-hint">Attach: <code>tmux attach -t ' + sessionName + '</code></span>';
+          html += '<button class="btn btn-danger btn-sm" onclick="shutdownSession(\\'' + sessionName.replace(/'/g, \"\\\\'\" ) + '\\')">Shutdown</button>';
+          html += '</div></div>';
+          html += '<div class="agents-grid">';
+          for (const t of terms) {
+            const status = t.status || null;
+            const statusLabel = status || '—';
+            const statusBadge = status ? '<span class="badge ' + statusClass(status) + '">' + escapeHtml(status) + '</span>' : '<span class="agent-last">—</span>';
+            html += '<div class="agent-card">';
+            html += '<div class="agent-name">' + escapeHtml(t.name || t.id) + '</div>';
+            html += '<div class="agent-meta"><span>Provider: ' + escapeHtml(t.provider || '') + '</span><span>Profile: ' + escapeHtml(t.agent_profile || '') + '</span></div>';
+            html += '<div class="agent-status-row">' + statusBadge + '<span class="agent-last">' + formatLastActive(t.last_active) + '</span></div>';
+            html += '</div>';
+          }
+          html += '</div></div>';
+        }
+        html += '</div>';
+        contentEl.innerHTML = html;
+      } catch (e) {
+        const msg = e.name === 'AbortError' ? 'Request timed out. Is the server running? Open from the same host (e.g. WSL) or try Refresh now.' : escapeHtml(e.message);
+        contentEl.innerHTML = '<p class="empty-state error-state">Failed to load: ' + msg + '</p>';
+      }
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(load, REFRESH_MS);
+    }
+    load();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the sessions and agents dashboard."""
+    return DASHBOARD_HTML
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
@@ -143,8 +588,20 @@ async def create_session(
         return result
 
     except ValueError as e:
+        logger.warning("Create session validation error: %s", e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except CursorProviderError as e:
+        logger.warning("Create session provider error: %s", e)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TimeoutError as e:
+        logger.warning("Create session timeout: %s", e)
+        log_hint = f" Check server log: {LOG_DIR}"
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=str(e) + log_hint,
+        )
     except Exception as e:
+        logger.exception("Failed to create session: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
@@ -159,6 +616,19 @@ async def list_sessions() -> List[Dict]:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list sessions: {str(e)}",
+        )
+
+
+@app.get("/debug/sessions")
+async def debug_sessions() -> Dict:
+    """Return detailed session and tmux state for debugging (why no session visible)."""
+    try:
+        return session_service.list_sessions_debug()
+    except Exception as e:
+        logger.exception("debug_sessions failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
         )
 
 

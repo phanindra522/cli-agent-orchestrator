@@ -14,10 +14,15 @@ def setup_logging() -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_file = LOG_DIR / f"cao_{timestamp}.log"
 
+    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter(format_str))
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(format_str))
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler(log_file)],
+        format=format_str,
+        handlers=[file_handler, console_handler],
     )
 
     print(f"Server logs: {log_file}")

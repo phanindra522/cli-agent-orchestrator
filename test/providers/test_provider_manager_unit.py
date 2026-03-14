@@ -107,6 +107,23 @@ def test_create_provider_claude_code():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_cursor_cli():
+    """Test creating Cursor CLI provider."""
+    from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CURSOR_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, CursorCliProvider)
+    assert manager.get_provider("t1") is provider
+
+
 def test_get_provider_not_in_database_raises():
     """Test get_provider raises when terminal not found in database."""
     manager = ProviderManager()

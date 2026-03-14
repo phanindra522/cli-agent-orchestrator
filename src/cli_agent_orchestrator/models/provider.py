@@ -9,3 +9,4 @@ class ProviderType(str, Enum):
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
     GEMINI_CLI = "gemini_cli"
+    CURSOR_CLI = "cursor_cli"

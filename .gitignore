@@ -22,6 +22,7 @@ dist/
 .DS_Store
 
 # Project specific
+.env
 *.log
 *.db
 .amazonq/
