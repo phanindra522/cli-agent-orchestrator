@@ -60,8 +60,13 @@ def launch(agents, session_name, headless, provider, yolo):
         if session_name:
             params["session_name"] = session_name
 
-        # Session creation can take 1–2 min for Cursor CLI (init + idle detection)
-        response = requests.post(url, params=params, timeout=130)
+        # Session creation can take 1–2+ min for Cursor CLI (init + idle detection); keep client timeout above server CAO_CURSOR_INIT_TIMEOUT
+        try:
+            cursor_init = float(os.getenv("CAO_CURSOR_INIT_TIMEOUT", "120"))
+        except ValueError:
+            cursor_init = 120.0
+        post_timeout = max(130.0, min(cursor_init + 30.0, 630.0))
+        response = requests.post(url, params=params, timeout=post_timeout)
         response.raise_for_status()
 
         terminal = response.json()

@@ -15,6 +15,7 @@ Key characteristics:
 """
 
 import logging
+import os
 import re
 import shlex
 import time
@@ -27,6 +28,14 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
+
+# Seconds to wait for Cursor CLI to show a ready prompt (see get_status). Override with CAO_CURSOR_INIT_TIMEOUT.
+def _cursor_init_timeout_seconds() -> float:
+    raw = os.getenv("CAO_CURSOR_INIT_TIMEOUT", "120")
+    try:
+        return max(30.0, min(float(raw), 600.0))
+    except ValueError:
+        return 120.0
 
 
 class ProviderError(Exception):
@@ -113,9 +122,10 @@ class CursorCliProvider(BaseProvider):
         # Accept it once by sending 'a' (Trust this workspace) then Enter.
         trust_prompt_sent = False
 
-        # Cursor CLI can be slow to start (auth check, first load); allow up to 120s
+        init_timeout = _cursor_init_timeout_seconds()
+        # Cursor CLI can be slow to start (auth check, first load)
         start = time.monotonic()
-        deadline = start + 120.0
+        deadline = start + init_timeout
         last_log_at = 0.0
         while time.monotonic() < deadline:
             elapsed = time.monotonic() - start
@@ -169,8 +179,9 @@ class CursorCliProvider(BaseProvider):
                     "Cursor CLI requires authentication. Run 'agent login' in a WSL terminal, then try again."
                 )
             raise TimeoutError(
-                "Cursor CLI initialization timed out after 120 seconds. "
-                "Check the tmux window for errors, or run 'agent --trust --yolo' manually to see the prompt. "
+                f"Cursor CLI initialization timed out after {int(init_timeout)} seconds. "
+                "Check the tmux window for errors, or run 'agent --yolo' manually to see the prompt. "
+                "If the UI is slow or first-run, set CAO_CURSOR_INIT_TIMEOUT (e.g. 300). "
                 "Server log has the last terminal output."
             )
 
